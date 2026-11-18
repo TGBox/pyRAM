@@ -52,3 +52,52 @@ In der zweiten Stufe kommt ein Recorder dazu, der Snapshots in SQLite schreibt u
 - Zielgruppe: nur für mich, Windows, Weitergabe als .exe
 - Läuft ohne Adminrechte
 - Stack: PySide6, uv, PyInstaller; `psutil` als neue Abhängigkeit
+
+---
+
+## Erweiterung: Block-Drilldown & System-Aufschlüsselung
+
+## Problemstellung (2)
+
+Wie könnten wir beim Klick auf jeden Block – insbesondere auf den großen grauen Block „System / Geteilt / Kernel“, auf `svchost.exe` und auf Multi-Prozess-Anwendungen – sofort verständlich zeigen, wofür der Speicher konkret verbraucht wird und ob man eingreifen kann?
+
+## Empfohlene Richtung (2)
+
+Jeder Block in der Treemap wird zoombar – auch „System / Geteilt / Kernel“.
+Ein Klick auf den Systemblock öffnet eine Unter-Treemap, die den unzugeordneten physischen RAM in zwei klar unterscheidbare Kategorien zerlegt:
+
+1. **Echter Kernel- & System-Speicher** (aus `GetPerformanceInfo` und `NtQuerySystemInformation`):
+   - *Kernel Nonpaged Pool* (nicht auslagerbarer Kernel-/Treiberspeicher)
+   - *Kernel Paged Pool* (auslagerbarer Kernel-Speicher)
+   - *System-Dateicache & Geänderte Seiten* (aktiver Datei-Cache & Modified List)
+   - *Geladene Kernel-Treiber* (`SystemModuleInformation`, inkl. Top-Treibern im Tooltip)
+2. **Geteilter Anwendungsspeicher (Shared Working Set)**:
+   - Der verbleibende Differenzbetrag entsteht durch Speicherseiten, die von mehreren Prozessen gemeinsam genutzt werden (DLLs, Chromium/Electron Shared Memory). Er wird anteilig nach dem Shared Working Set (`working_set - private_ws`) der Anwendungen aufgeschlüsselt (z. B. „Geteilt: Antigravity IDE.exe“, „Geteilt: firefox.exe“). Ein Klick darauf führt direkt zum jeweiligen Anwendungs-Zoom.
+
+Beim Zoom in **Anwendungsblöcke** werden Einzelprozesse intelligent beschriftet (lazy beim Zoomen geladen und per `(pid, created)` gecacht):
+
+- **`svchost.exe`**: Löst über den Windows Service Manager (`psutil.win_service_iter`) die enthaltenen Dienste auf (z. B. „Windows Update“, „DNS-Client“, „Windows-Audio“).
+- **Multi-Prozess-Apps (Browser, Electron, Python/Node)**: Extrahiert aus den Startargumenten (`cmdline`) die lesbare Rolle (`GPU-Prozess`, `Renderer`, `Extension-Host`, `Netzwerkdienst`, `Audio-Service`, `Hauptprozess` oder den Skriptnamen).
+- **Shared-RAM-Sichtbarkeit**: Jede App- und Prozesskachel zeigt im Tooltip (und optional als Zusatzinfo) neben dem Private Working Set auch ihren geteilten Speicher (`Shared WS = Working Set - Private WS`).
+
+## Geprüfte Annahmen
+
+- [x] Kernel-Pools, Dateicache, Modified List und Treiber-Module lassen sich ohne Adminrechte in < 1 ms abfragen (getestet via `psapi` und `ntdll`).
+- [x] Windows-Dienste (`win_service_iter`) lassen sich ohne Adminrechte ihren `svchost`-PIDs zuordnen (~34 ms einmalig beim Zoomen).
+- [ ] Die proportionale Zuordnung des Shared-RAM-Rests nach `working_set - private_ws` deckt sich für den Nutzer nachvollziehbar mit den laufenden Großanwendungen.
+
+## MVP-Umfang (2)
+
+**Drin:**
+
+- Klick-Zoom in den Block „System / Geteilt / Kernel“ mit Aufschlüsselung in Kernel-Pools, System-Cache/Modified, Kernel-Treiber-Images und anteiligen Shared-RAM pro Anwendung
+- Erklärende Tooltips im System-Zoom („Was ist das?“ + „Kann ich etwas tun?“)
+- Dienstnamen-Auflösung für `svchost.exe`-Prozesse im Gruppen-Zoom
+- Rollen-Erkennung aus Startargumenten (`--type=...`, Skriptpfade) für Anwendungs-Unterprozesse mit `(pid, created)`-Cache
+- Ausweis des geteilten Working Sets (`working_set - private_ws`) in Gruppen- und Prozess-Tooltips
+
+**Draußen (Nicht tun – und warum):**
+
+- **Einzelne `.sys`-Treiber als 150 Mini-Kacheln:** Liefert ohne Admin-Pool-Tagging nur Datei-Image-Größen statt echter Treiber-Allokationen; Top-Treiber gehören in den Tooltip der Treiber-Kachel.
+- **Prozess-Beenden-Aktion auf Kernel-/System-Kacheln:** Kernel-Pools und Caches sind keine beendbaren Prozesse; ein Klick auf „Geteilt: `<App>`“ wechselt stattdessen in den Zoom dieser App.
+- **Abfrage von `cmdline()` und Diensten alle 2 Sekunden für alle 400 Prozesse:** Unnötige CPU-Last; wird nur bei Bedarf (im Zoom) abgefragt und über `(pid, created)` gecacht.

@@ -24,9 +24,11 @@ from PySide6.QtWidgets import (
 try:
     from src.sampler import (
         AppGroup,
+        ProcessDetailResolver,
         ProcSample,
         SamplerWorker,
         Snapshot,
+        SystemSlice,
         TreemapRect,
         squarify,
         terminate_processes,
@@ -34,15 +36,33 @@ try:
 except ImportError:
     from sampler import (
         AppGroup,
+        ProcessDetailResolver,
         ProcSample,
         SamplerWorker,
         Snapshot,
+        SystemSlice,
         TreemapRect,
         squarify,
         terminate_processes,
     )
 
 SYSTEM_KEY = "__system__"
+
+_SYS_DARK_COLORS = {
+    "sys:nonpaged": "#3b4c6b",
+    "sys:paged": "#475569",
+    "sys:cache": "#36535e",
+    "sys:drivers": "#4b4563",
+    "sys:shared_other": "#3f4c5e",
+}
+
+_SYS_LIGHT_COLORS = {
+    "sys:nonpaged": "#bfdbfe",
+    "sys:paged": "#cbd5e1",
+    "sys:cache": "#bae6fd",
+    "sys:drivers": "#ddd6fe",
+    "sys:shared_other": "#e2e8f0",
+}
 
 
 def format_bytes(num_bytes: int) -> str:
@@ -57,9 +77,14 @@ def format_bytes(num_bytes: int) -> str:
 
 
 def _tile_color(key: str, dark_mode: bool) -> QColor:
-    """Return a deterministic, readable tile background color for a group or process."""
+    """Return a deterministic, readable tile background color for a group, process, or slice."""
     if key == SYSTEM_KEY:
         return QColor("#334155") if dark_mode else QColor("#cbd5e1")
+    if key.startswith("shared:"):
+        return _tile_color(key.removeprefix("shared:"), dark_mode)
+    if key.startswith("sys:"):
+        palette = _SYS_DARK_COLORS if dark_mode else _SYS_LIGHT_COLORS
+        return QColor(palette.get(key, "#475569" if dark_mode else "#cbd5e1"))
     hue = (zlib.crc32(key.encode("utf-8")) * 137) % 360
     if dark_mode:
         return QColor.fromHsl(hue, 130, 82)
@@ -279,24 +304,27 @@ class TreemapWidget(QWidget):
         self._dark_mode = True
         self._hovered_key: str | None = None
         self._rects: list[TreemapRect] = []
+        self._resolver = ProcessDetailResolver()
         self.setMouseTracking(True)
         self.setMinimumSize(320, 240)
 
     @property
     def zoomed_group(self) -> str | None:
-        """Currently zoomed application group name, or None in overview mode."""
+        """Currently zoomed application group name, SYSTEM_KEY, or None in overview mode."""
         return self._zoomed_group
 
     def set_snapshot(self, snapshot: Snapshot | None) -> None:
-        """Update the rendered snapshot and reset zoom if the zoomed group vanished."""
+        """Update the rendered snapshot and reset zoom if the zoomed target vanished."""
         self._snapshot = snapshot
-        if (
-            self._zoomed_group is not None
-            and snapshot is not None
-            and self._find_group(self._zoomed_group) is None
-        ):
-            self._zoomed_group = None
-            self.zoom_changed.emit(None)
+        if self._zoomed_group is not None and snapshot is not None:
+            still_exists = (
+                bool(snapshot.system_slices)
+                if self._zoomed_group == SYSTEM_KEY
+                else self._find_group(self._zoomed_group) is not None
+            )
+            if not still_exists:
+                self._zoomed_group = None
+                self.zoom_changed.emit(None)
         self._recompute_layout()
         self.update()
 
@@ -337,6 +365,14 @@ class TreemapWidget(QWidget):
                 return proc
         return None
 
+    def _find_system_slice(self, key: str) -> SystemSlice | None:
+        if self._snapshot is None:
+            return None
+        for item in self._snapshot.system_slices:
+            if item.key == key:
+                return item
+        return None
+
     def _layout_items(self) -> list[tuple[str, float]]:
         if self._snapshot is None:
             return []
@@ -349,6 +385,13 @@ class TreemapWidget(QWidget):
             if self._show_system_block and self._snapshot.unattributed_ram > 0:
                 items.append((SYSTEM_KEY, float(self._snapshot.unattributed_ram)))
             return items
+
+        if self._zoomed_group == SYSTEM_KEY:
+            return [
+                (item.key, float(item.bytes_value))
+                for item in self._snapshot.system_slices
+                if item.bytes_value > 0
+            ]
 
         group = self._find_group(self._zoomed_group)
         if group is None:
@@ -399,11 +442,28 @@ class TreemapWidget(QWidget):
                 return group.name, f"{size_text} · {len(group.processes)} Proz."
             return group.name, size_text
 
+        if self._zoomed_group == SYSTEM_KEY:
+            item = self._find_system_slice(key)
+            if item is None:
+                return key, ""
+            if item.category == "shared" and item.raw_shared_ws > 0:
+                return (
+                    item.title,
+                    f"{format_bytes(item.bytes_value)} · Brutto {format_bytes(item.raw_shared_ws)}",
+                )
+            return item.title, format_bytes(item.bytes_value)
+
         group = self._find_group(self._zoomed_group)
         proc = self._find_proc(group, key) if group is not None else None
-        if proc is None:
+        if proc is None or group is None:
             return key, ""
-        return proc.name, f"{format_bytes(proc.private_ws)} · PID {proc.pid}"
+        role, _cmd, _services = self._resolver.resolve(proc, group.name)
+        primary = f"{role} (PID {proc.pid})" if role else f"{proc.name} (PID {proc.pid})"
+        if proc.shared_ws >= 1024**2:
+            secondary = f"{format_bytes(proc.private_ws)} · Geteilt {format_bytes(proc.shared_ws)}"
+        else:
+            secondary = format_bytes(proc.private_ws)
+        return primary, secondary
 
     def _tooltip_for(self, key: str) -> str:
         if self._snapshot is None:
@@ -413,13 +473,29 @@ class TreemapWidget(QWidget):
         if self._zoomed_group is None:
             if key == SYSTEM_KEY:
                 pct = (self._snapshot.unattributed_ram / used_base) * 100
-                return (
-                    "System / Geteilt / Kernel\n"
-                    f"Größe: {format_bytes(self._snapshot.unattributed_ram)} "
-                    f"({pct:.1f} % des belegten RAM)\n"
-                    "Physischer RAM außerhalb privater Prozess-Working-Sets\n"
-                    "(Kernel, Treiber, geteilte DLLs)"
+                bd = self._snapshot.system_breakdown
+                lines = [
+                    "System / Geteilt / Kernel",
+                    (
+                        f"Größe: {format_bytes(self._snapshot.unattributed_ram)} "
+                        f"({pct:.1f} % des belegten RAM)"
+                    ),
+                ]
+                kernel_sum = bd.kernel_nonpaged + bd.kernel_paged
+                shared_est = sum(
+                    item.bytes_value
+                    for item in self._snapshot.system_slices
+                    if item.category == "shared"
                 )
+                if kernel_sum or bd.system_cache:
+                    lines.append(
+                        f"Kernel-Pools: {format_bytes(kernel_sum)} · "
+                        f"Cache/Modified: {format_bytes(bd.system_cache)}"
+                    )
+                if shared_est:
+                    lines.append(f"Geteilter App-RAM (geschätzt): {format_bytes(shared_est)}")
+                lines.append("Linksklick: Aufschlüsselung öffnen")
+                return "\n".join(lines)
             group = self._find_group(key)
             if group is None:
                 return ""
@@ -429,23 +505,50 @@ class TreemapWidget(QWidget):
                 f"Prozesse: {len(group.processes)}\n"
                 f"Privates Working Set: {format_bytes(group.private_ws)} "
                 f"({pct:.1f} % des belegten RAM)\n"
+                f"Geteiltes Working Set: {format_bytes(group.shared_ws)}\n"
                 f"Working Set gesamt: {format_bytes(group.working_set)}\n"
                 f"Private Bytes (Commit): {format_bytes(group.private_bytes)}\n"
                 "Linksklick: Zoomen · Rechtsklick: Beenden"
             )
 
+        if self._zoomed_group == SYSTEM_KEY:
+            item = self._find_system_slice(key)
+            if item is None:
+                return ""
+            unattr_base = max(self._snapshot.unattributed_ram, 1)
+            pct = (item.bytes_value / unattr_base) * 100
+            lines = [
+                item.title,
+                f"Größe: {format_bytes(item.bytes_value)} ({pct:.1f} % des System-/Geteilt-Blocks)",
+            ]
+            if item.raw_shared_ws > 0:
+                lines.append(f"Brutto-Shared-WS der App: {format_bytes(item.raw_shared_ws)}")
+            lines.append(item.description)
+            return "\n".join(lines)
+
         group = self._find_group(self._zoomed_group)
         proc = self._find_proc(group, key) if group is not None else None
-        if proc is None:
+        if proc is None or group is None:
             return ""
-        return (
-            f"{proc.name} (PID {proc.pid})\n"
-            f"Eltern-PID: {proc.ppid}\n"
-            f"Privates Working Set: {format_bytes(proc.private_ws)}\n"
-            f"Working Set gesamt: {format_bytes(proc.working_set)}\n"
-            f"Private Bytes (Commit): {format_bytes(proc.private_bytes)}\n"
-            "Rechtsklick: Prozess beenden · Esc/Zurück: Übersicht"
+        role, short_cmd, services = self._resolver.resolve(proc, group.name)
+        lines = [f"{proc.name} (PID {proc.pid})"]
+        if role:
+            lines.append(f"Rolle / Dienst: {role}")
+        if len(services) > 2:
+            lines.append(f"Dienste: {', '.join(services)}")
+        lines.extend(
+            [
+                f"Eltern-PID: {proc.ppid}",
+                f"Privates Working Set: {format_bytes(proc.private_ws)}",
+                f"Geteiltes Working Set: {format_bytes(proc.shared_ws)}",
+                f"Working Set gesamt: {format_bytes(proc.working_set)}",
+                f"Private Bytes (Commit): {format_bytes(proc.private_bytes)}",
+            ]
         )
+        if short_cmd:
+            lines.append(f"Befehlszeile: {short_cmd}")
+        lines.append("Rechtsklick: Prozess beenden · Esc/Zurück: Übersicht")
+        return "\n".join(lines)
 
     def paintEvent(self, event: Any) -> None:
         """Render all treemap tiles and readable clipped labels."""
@@ -551,8 +654,16 @@ class TreemapWidget(QWidget):
 
         rect = self._rect_at(event.position())
         if event.button() == Qt.MouseButton.LeftButton:
-            if self._zoomed_group is None and rect is not None and rect.key != SYSTEM_KEY:
+            if self._zoomed_group is None and rect is not None:
                 self.set_zoomed_group(rect.key)
+            elif self._zoomed_group == SYSTEM_KEY and rect is not None:
+                item = self._find_system_slice(rect.key)
+                if (
+                    item is not None
+                    and item.target_group
+                    and self._find_group(item.target_group) is not None
+                ):
+                    self.set_zoomed_group(item.target_group)
             return
 
         if event.button() == Qt.MouseButton.RightButton:
@@ -564,7 +675,12 @@ class TreemapWidget(QWidget):
         menu = QMenu(self)
 
         if self._zoomed_group is None:
-            if rect is None or rect.key == SYSTEM_KEY:
+            if rect is None:
+                return
+            if rect.key == SYSTEM_KEY:
+                drill_act = menu.addAction("System-/Geteilt-Block aufschlüsseln…")
+                if menu.exec(global_pos) == drill_act:
+                    self.set_zoomed_group(SYSTEM_KEY)
                 return
             group = self._find_group(rect.key)
             if group is None:
@@ -585,6 +701,26 @@ class TreemapWidget(QWidget):
                     [proc.pid for proc in group.processes],
                     group.private_ws,
                 )
+            return
+
+        if self._zoomed_group == SYSTEM_KEY:
+            jump_act = None
+            target_group: str | None = None
+            if rect is not None:
+                item = self._find_system_slice(rect.key)
+                if (
+                    item is not None
+                    and item.target_group
+                    and self._find_group(item.target_group) is not None
+                ):
+                    target_group = item.target_group
+                    jump_act = menu.addAction(f"Auf „{target_group}“ zoomen")
+            back_act = menu.addAction("← Zurück zur Übersicht")
+            chosen = menu.exec(global_pos)
+            if chosen == back_act:
+                self.set_zoomed_group(None)
+            elif jump_act is not None and chosen == jump_act and target_group is not None:
+                self.set_zoomed_group(target_group)
             return
 
         term_proc_act = None
@@ -749,6 +885,13 @@ class MainWindow(QMainWindow):
             total_procs = sum(len(group.processes) for group in self._snapshot.groups)
             self._status_label.setText(
                 f"Übersicht: {len(self._snapshot.groups)} Anwendungen ({total_procs} Prozesse)"
+            )
+            return
+
+        if zoomed == SYSTEM_KEY:
+            self._status_label.setText(
+                f"Ansicht: System / Geteilt / Kernel ({format_bytes(self._snapshot.unattributed_ram)}) "
+                "– Klick auf „Geteilt: …“ öffnet die Anwendung"
             )
             return
 

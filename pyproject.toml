@@ -1,6 +1,6 @@
 [project]
 name = "pyRAM"
-version = "0.1.1"
+version = "0.2.0"
 description = "A small python GUI application that helps to survey and analyze the RAM of the PC."
 requires-python = ">=3.11"
 license = { text = "MIT" }
